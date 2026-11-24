@@ -81,7 +81,7 @@ async function auth(req, _res, next) {
     req.user = null;
     if (t) {
       const r = await pool.query(
-        "SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=$1",
+        "SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=$1 AND s.created_at > now() - interval '90 days'",
         [t]
       );
       req.user = r.rows[0] || null;
@@ -129,6 +129,32 @@ async function syncSubscription(sub) {
   }
 }
 
+
+// ---- sécurité : en-têtes ----
+app.disable("x-powered-by");
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  if (process.env.NODE_ENV === "production") res.setHeader("Strict-Transport-Security", "max-age=15552000");
+  next();
+});
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// ---- limiteur de tentatives (mémoire, par IP) ----
+const hits = new Map();
+function limit(max, windowMs) {
+  return (req, res, next) => {
+    const k = req.path + "|" + req.ip, now = Date.now();
+    const h = hits.get(k);
+    if (!h || h.reset < now) hits.set(k, { n: 1, reset: now + windowMs });
+    else if (++h.n > max) return res.status(429).json({ error: "Trop de tentatives, réessaie dans quelques minutes." });
+    next();
+  };
+}
+setInterval(() => { const n = Date.now(); for (const [k, v] of hits) if (v.reset < n) hits.delete(k); }, 60000).unref();
+
 // ---- webhook Stripe (corps brut, avant express.json) ----
 app.post("/api/stripe-webhook", express.raw({ type: "application/json" }), async (req, res) => {
   const secret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -162,7 +188,7 @@ app.use(auth);
 
 // ---- comptes ----
 const emailOk = (e) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e);
-app.post("/api/register", async (req, res) => {
+app.post("/api/register", limit(10, 15 * 60 * 1000), async (req, res) => {
   const name = String((req.body && req.body.name) || "").trim().slice(0, 60);
   const email = String((req.body && req.body.email) || "").trim().toLowerCase();
   const pw = String((req.body && req.body.password) || "");
@@ -181,7 +207,7 @@ app.post("/api/register", async (req, res) => {
     res.status(500).json({ error: "Erreur serveur" });
   }
 });
-app.post("/api/login", async (req, res) => {
+app.post("/api/login", limit(10, 15 * 60 * 1000), async (req, res) => {
   const email = String((req.body && req.body.email) || "").trim().toLowerCase();
   const pw = String((req.body && req.body.password) || "");
   const r = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
@@ -211,7 +237,7 @@ app.post("/api/workout/start", need, async (req, res) => {
 });
 
 // ---- paiement ----
-app.post("/api/checkout", need, async (req, res) => {
+app.post("/api/checkout", need, limit(20, 15 * 60 * 1000), async (req, res) => {
   if (!stripe) return res.status(500).json({ error: "STRIPE_SECRET_KEY manquante" });
   const key = req.body && req.body.plan;
   const plan = PLANS[key];
@@ -272,10 +298,18 @@ app.use((err, _req, res, _next) => {
   console.error(err.message);
   res.status(500).json({ error: "Erreur serveur" });
 });
+const page = (f) => (_req, res) => res.sendFile(require("path").join(__dirname, "pages", f));
+app.get("/cgu", page("cgu.html"));
+app.get("/confidentialite", page("confidentialite.html"));
+app.get("/mentions-legales", page("mentions.html"));
+app.get("/robots.txt", (_req, res) => res.type("text/plain").send("User-agent: *\nAllow: /\n"));
 app.get("/", (_req, res) => res.sendFile(require("path").join(__dirname, "index.html")));
 
+const cleanSessions = () => pool.query("DELETE FROM sessions WHERE created_at < now() - interval '90 days'").catch((e) => console.error("clean", e.message));
+setInterval(cleanSessions, 6 * 3600 * 1000).unref();
+
 initDb()
-  .then(() => app.listen(process.env.PORT || 8080, "0.0.0.0"))
+  .then(() => { cleanSessions(); return app.listen(process.env.PORT || 8080, "0.0.0.0"); })
   .catch((e) => {
     console.error("DB:", e.message);
     process.exit(1);
