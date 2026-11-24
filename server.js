@@ -4,6 +4,7 @@ const { Pool } = require("pg");
 const Stripe = require("stripe");
 
 const app = express();
+app.set("trust proxy", 1); // derrière le proxy Railway : req.protocol = https
 const PLANS = {
   basic: { name: "vyrk BASIC", amount: 299, weekly: 3 },
   premium: { name: "vyrk PREMIUM", amount: 499, weekly: Infinity },
@@ -16,6 +17,7 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: false,
 });
+pool.on("error", (e) => console.error("pg idle", e.message)); // évite un crash sur coupure de connexion
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 async function initDb() {
@@ -231,7 +233,7 @@ app.post("/api/checkout", need, async (req, res) => {
           product_data: { name: plan.name },
         },
       }],
-      subscription_data: { trial_period_days: 30, metadata: { user_id: String(u.id), plan: key } },
+      subscription_data: { ...(u.stripe_customer_id ? {} : { trial_period_days: 30 }), metadata: { user_id: String(u.id), plan: key } },
       allow_promotion_codes: true,
       success_url: `${origin}/?session_id={CHECKOUT_SESSION_ID}#abonnement`,
       cancel_url: `${origin}/#abonnement`,
